@@ -246,37 +246,23 @@ export function scoreRules(rules) {
 
 // ─── SELF-LEARNING: RULE VERSIONING + DRIFT DETECTION ───────────────────────
 
-/**
- * ruleKey: canonical string ID for a rule, direction-agnostic
- * e.g. "BBQ Bacon Burger → Coffee (Hot)"
- */
 function ruleKey(rule) {
   return rule.antecedents.join(", ") + " → " + rule.consequents.join(", ");
 }
 
-/**
- * Classify how a rule changed between two iterations.
- * Returns one of: "stable" | "improved" | "declined" | "new" | "lost" | "volatile"
- */
 function classifyDrift(prev, curr) {
   if (!prev) return "new";
   if (!curr) return "lost";
   const liftDelta = curr.lift - prev.lift;
   const suppDelta = curr.support - prev.support;
-  const confDelta = curr.confidence - prev.confidence;
   const scoreDelta = curr.score - prev.score;
 
-  // Volatile: large swings in multiple metrics
   if (Math.abs(liftDelta) > 0.3 && Math.abs(suppDelta) > 0.02) return "volatile";
   if (scoreDelta > 0.05) return "improved";
   if (scoreDelta < -0.05) return "declined";
   return "stable";
 }
 
-/**
- * Compute drift between two rule sets (prev iteration vs current).
- * Returns per-rule status and summary statistics.
- */
 export function computeDrift(prevRules, currRules) {
   const prevMap = {};
   const currMap = {};
@@ -312,20 +298,17 @@ export function computeDrift(prevRules, currRules) {
     volatile: driftReport.filter(r => r.status === "volatile").length,
   };
 
-  // Stability score: % of rules that survived and stayed stable/improved
   const survived = driftReport.filter(r => r.status !== "lost" && r.status !== "new");
   const stableOrBetter = survived.filter(r => r.status === "stable" || r.status === "improved");
   summary.stabilityScore = survived.length > 0
     ? +(stableOrBetter.length / survived.length * 100).toFixed(1)
     : 100;
 
-  // Top movers: biggest positive lift delta
   summary.topGainers = driftReport
     .filter(r => r.liftDelta !== null && r.liftDelta > 0)
     .sort((a, b) => b.liftDelta - a.liftDelta)
     .slice(0, 3);
 
-  // Top fallers: biggest negative lift delta
   summary.topFallers = driftReport
     .filter(r => r.liftDelta !== null && r.liftDelta < 0)
     .sort((a, b) => a.liftDelta - b.liftDelta)
@@ -334,9 +317,6 @@ export function computeDrift(prevRules, currRules) {
   return { driftReport, summary };
 }
 
-/**
- * Build an iteration snapshot for the learning log.
- */
 export function buildIterationSnapshot(iteration, fileName, rules, meta, prevRules) {
   const drift = prevRules ? computeDrift(prevRules, rules) : null;
   const topRules = rules.slice(0, 5).map(r => ({
@@ -354,8 +334,7 @@ export function buildIterationSnapshot(iteration, fileName, rules, meta, prevRul
     meta: { ...meta },
     topRules,
     drift,
-    // Did the system change its thresholds vs previous run?
-    thresholdShift: null, // filled externally by App
+    thresholdShift: null,
   };
 }
 
@@ -390,7 +369,7 @@ export function buildBundles(itemsets, rules, priceMap, topN = 12) {
     return best || null;
   }
 
-  // --- FIX: also look up support directly from itemset supportMap for fallback confidence ---
+  // Build supportMap for direct metric computation
   const supportMap = {};
   for (const { itemset, support } of itemsets) {
     supportMap[itemset.slice().sort().join("|")] = support;
@@ -398,7 +377,34 @@ export function buildBundles(itemsets, rules, priceMap, topN = 12) {
 
   const bundles = multi.map(({ itemset, support }) => {
     const rule = bestRuleForItemset(itemset);
-    const lift = rule ? rule.lift : (1 + support * 2);
+
+    // ── FIX: Always recompute confidence + lift directly from supportMap ──
+    // The matched rule may use a different antecedent direction, corrupting values.
+    // We pick the antecedent that yields the highest confidence (most natural direction).
+    let realConfidence, realLift;
+    {
+      let bestConf = null, bestConsSupport = null;
+      for (const item of itemset) {
+        const antSupport = supportMap[item];
+        if (antSupport) {
+          const c = support / antSupport;
+          if (bestConf === null || c > bestConf) {
+            bestConf = c;
+            const consKey = itemset.filter(i => i !== item).slice().sort().join("|");
+            bestConsSupport = supportMap[consKey] || null;
+          }
+        }
+      }
+      realConfidence = bestConf !== null
+        ? +(bestConf).toFixed(4)
+        : +(Math.min(support * 1.5, 1)).toFixed(4);
+      realLift = (bestConf !== null && bestConsSupport)
+        ? +(bestConf / bestConsSupport).toFixed(4)
+        : rule ? +(rule.lift).toFixed(4) : +(1 + support * 2).toFixed(4);
+    }
+    const lift = realLift;
+    // ─────────────────────────────────────────────────────────────────────
+
     const sizeBonus = 1 + 0.2 * (itemset.length - 1);
     const rankScore = support * sizeBonus * lift;
     const price = itemset.reduce((s, i) => s + (priceMap[i] || 0), 0);
@@ -407,28 +413,11 @@ export function buildBundles(itemsets, rules, priceMap, topN = 12) {
     const sorted = [...itemset].sort((a, b) => (priceMap[b] || 0) - (priceMap[a] || 0));
     const name = sorted.slice(0, 2).join(" + ") + (itemset.length >= 3 ? " Combo" : " Deal");
 
-    // FIXED: compute real confidence from supportMap when no rule matched
-    let realConfidence;
-    if (rule) {
-      realConfidence = +(rule.confidence).toFixed(3);
-    } else {
-      // Find best single-item antecedent for this itemset
-      let bestConf = null;
-      for (const item of itemset) {
-        const antSupport = supportMap[item];
-        if (antSupport) {
-          const c = support / antSupport;
-          if (bestConf === null || c > bestConf) bestConf = c;
-        }
-      }
-      realConfidence = bestConf !== null ? +(bestConf).toFixed(3) : +(support * 1.5 > 1 ? 1 : support * 1.5).toFixed(3);
-    }
-
     return {
       name, items: itemset,
       support: +support.toFixed(4),
       confidence: realConfidence,
-      lift: +(lift).toFixed(3),
+      lift: +(lift).toFixed(4),
       leverage: rule ? +(rule.leverage).toFixed(5) : +(support * 0.1).toFixed(5),
       conviction: rule ? +(Math.min(rule.conviction, 10)).toFixed(3) : +(1 + support).toFixed(3),
       score: rule ? +(rule.score).toFixed(4) : +(rankScore).toFixed(4),
